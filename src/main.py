@@ -715,7 +715,6 @@ def main():
         input_size=(640, 640),
         confidence_threshold=CONFIDENCE_THRESHOLD,
         nms_threshold=0.3,
-        gpu_lock=gpu_lock,
     )
 
     vehicle_detector = VehicleDetectorGPU(
