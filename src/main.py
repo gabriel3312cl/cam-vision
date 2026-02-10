@@ -79,7 +79,7 @@ def is_valid_face(x, y, w_box, h_box, landmarks):
 class StatsTracker:
     """Thread-safe statistics collector shared across all cameras."""
 
-    def __init__(self, max_recent=5):
+    def __init__(self, max_recent=4):
         self.lock = threading.Lock()
         self.max_recent = max_recent
         # Face stats
@@ -205,8 +205,13 @@ class StatsTracker:
                 'active_faces': dict(self.active_face_tracks),
                 'active_vehicles': dict(self.active_vehicle_tracks),
                 'uptime': time.time() - self.start_time,
-                'uptime': time.time() - self.start_time,
             }
+
+    def store_rendered(self, faces_list, vehicles_list):
+        """Store the last rendered lists so click targets match what's displayed."""
+        with self.lock:
+            self._rendered_faces = faces_list
+            self._rendered_vehicles = vehicles_list
 
     def update_recent_path(self, item_type, idx, path):
         """Update the file path for a recent item (for detail view)."""
@@ -221,19 +226,72 @@ class StatsTracker:
     def get_click_target(self, x, y):
         """Check if a click at (x,y) hits a thumbnail. Returns file path or None."""
         with self.lock:
-            # Check faces
-            for item in self.recent_faces:
-                if 'rect' in item and item['face_path']:
+            # Use rendered lists (matches what user sees)
+            for item in getattr(self, '_rendered_faces', []):
+                if 'rect' in item and item.get('face_path') and not item.get('fp'):
                     rx, ry, rw, rh = item['rect']
                     if rx <= x <= rx + rw and ry <= y <= ry + rh:
                         return item['face_path']
-            # Check vehicles
-            for item in self.recent_vehicles:
-                if 'rect' in item and item['vehicle_path']:
+            for item in getattr(self, '_rendered_vehicles', []):
+                if 'rect' in item and item.get('vehicle_path') and not item.get('fp'):
                     rx, ry, rw, rh = item['rect']
                     if rx <= x <= rx + rw and ry <= y <= ry + rh:
                         return item['vehicle_path']
         return None
+
+    def get_fp_target(self, x, y):
+        """Check if a right-click at (x,y) hits a thumbnail. Returns (type, index, item) or (None, None, None)."""
+        with self.lock:
+            for i, item in enumerate(getattr(self, '_rendered_faces', [])):
+                if 'rect' in item:
+                    rx, ry, rw, rh = item['rect']
+                    if rx <= x <= rx + rw and ry <= y <= ry + rh:
+                        return 'face', i, item
+            for i, item in enumerate(getattr(self, '_rendered_vehicles', [])):
+                if 'rect' in item:
+                    rx, ry, rw, rh = item['rect']
+                    if rx <= x <= rx + rw and ry <= y <= ry + rh:
+                        return 'vehicle', i, item
+        return None, None, None
+
+    def mark_false_positive(self, item_type, item):
+        """Mark a detection as false positive."""
+        with self.lock:
+            if item.get('fp'):
+                return  # Already marked
+            item['fp'] = True
+
+            if item_type == 'face':
+                self.total_faces = max(0, self.total_faces - 1)
+                cam = item.get('camera', '')
+                if cam in self.faces_per_camera:
+                    self.faces_per_camera[cam] = max(0, self.faces_per_camera[cam] - 1)
+                path_key = 'face_path'
+            else:
+                self.total_vehicles = max(0, self.total_vehicles - 1)
+                cam = item.get('camera', '')
+                if cam in self.vehicles_per_camera:
+                    self.vehicles_per_camera[cam] = max(0, self.vehicles_per_camera[cam] - 1)
+                cls = item.get('class', 'vehicle')
+                if cls in self.vehicle_classes_count:
+                    self.vehicle_classes_count[cls] = max(0, self.vehicle_classes_count[cls] - 1)
+                path_key = 'vehicle_path'
+
+            # Rename folder with _FP suffix
+            file_path = item.get(path_key)
+            if file_path:
+                parent = os.path.dirname(file_path)
+                if os.path.isdir(parent) and not parent.endswith('_FP'):
+                    new_parent = parent + '_FP'
+                    try:
+                        os.rename(parent, new_parent)
+                        item[path_key] = os.path.join(new_parent, os.path.basename(file_path))
+                        fp_log = os.path.join(OUTPUT_DIR, 'false_positives.log')
+                        with open(fp_log, 'a') as f:
+                            f.write(f"{datetime.now().isoformat()} | {item_type} | {cam} | ID {item.get('id')} | {parent}\n")
+                        print(f"[FP] Marked as false positive: {parent}")
+                    except OSError as e:
+                        print(f"[FP] Error renaming: {e}")
 
 
 
@@ -312,6 +370,7 @@ def render_dashboard(stats, width=420, height=720):
     cv2.line(dash, (15, y), (width - 15, y), COL_BORDER, 1)
     y += 18
     _draw_text(dash, "RECENT FACES", (15, y), 0.4, COL_DIM)
+    _draw_text(dash, "(Right-click = FP)", (140, y), 0.3, COL_DIM)
     y += 8
 
     thumb_h = 52
@@ -323,11 +382,17 @@ def render_dashboard(stats, width=420, height=720):
         # Store rect for hit-testing
         entry['rect'] = (15, y, thumb_h, thumb_h)
         
-        cv2.rectangle(dash, (14, y - 1), (16 + thumb_h, y + thumb_h + 1), COL_BORDER, 1)
+        is_fp = entry.get('fp', False)
+        border_color = (0, 0, 200) if is_fp else COL_BORDER
+        cv2.rectangle(dash, (14, y - 1), (16 + thumb_h, y + thumb_h + 1), border_color, 1 if not is_fp else 2)
         dash[y:y + thumb_h, 15:15 + thumb_h] = thumb
         tx = 15 + thumb_h + 10
-        _draw_text(dash, f"Person {entry['id']}", (tx, y + 16), 0.42, COL_TEXT)
-        _draw_text(dash, entry['camera'], (tx, y + 32), 0.35, COL_GREEN)
+        if is_fp:
+            _draw_text(dash, f"Person {entry['id']} [FP]", (tx, y + 16), 0.42, (0, 0, 200))
+            _draw_text(dash, "FALSE POSITIVE", (tx, y + 32), 0.35, (0, 0, 200))
+        else:
+            _draw_text(dash, f"Person {entry['id']}", (tx, y + 16), 0.42, COL_TEXT)
+            _draw_text(dash, entry['camera'], (tx, y + 32), 0.35, COL_GREEN)
         _draw_text(dash, entry['time'], (tx, y + 46), 0.32, COL_DIM)
         y += thumb_h + 4
 
@@ -337,6 +402,7 @@ def render_dashboard(stats, width=420, height=720):
     cv2.line(dash, (15, y), (width - 15, y), COL_BORDER, 1)
     y += 18
     _draw_text(dash, "RECENT VEHICLES", (15, y), 0.4, COL_DIM)
+    _draw_text(dash, "(Right-click = FP)", (160, y), 0.3, COL_DIM)
     y += 8
 
     vthumb_w, vthumb_h = 80, 52
@@ -348,11 +414,17 @@ def render_dashboard(stats, width=420, height=720):
         # Store rect for hit-testing
         entry['rect'] = (15, y, vthumb_w, vthumb_h)
 
-        cv2.rectangle(dash, (14, y - 1), (16 + vthumb_w, y + vthumb_h + 1), COL_BORDER, 1)
+        is_fp = entry.get('fp', False)
+        border_color = (0, 0, 200) if is_fp else COL_BORDER
+        cv2.rectangle(dash, (14, y - 1), (16 + vthumb_w, y + vthumb_h + 1), border_color, 1 if not is_fp else 2)
         dash[y:y + vthumb_h, 15:15 + vthumb_w] = thumb
         tx = 15 + vthumb_w + 10
-        _draw_text(dash, f"Vehicle {entry['id']} ({entry['class']})", (tx, y + 16), 0.42, COL_TEXT)
-        _draw_text(dash, entry['camera'], (tx, y + 32), 0.35, COL_ORANGE)
+        if is_fp:
+            _draw_text(dash, f"Vehicle {entry['id']} [FP]", (tx, y + 16), 0.42, (0, 0, 200))
+            _draw_text(dash, "FALSE POSITIVE", (tx, y + 32), 0.35, (0, 0, 200))
+        else:
+            _draw_text(dash, f"Vehicle {entry['id']} ({entry['class']})", (tx, y + 16), 0.42, COL_TEXT)
+            _draw_text(dash, entry['camera'], (tx, y + 32), 0.35, COL_ORANGE)
         _draw_text(dash, entry['time'], (tx, y + 46), 0.32, COL_DIM)
         y += vthumb_h + 4
 
@@ -689,6 +761,7 @@ def build_grid(frames, cols=2, cell_size=(640, 480)):
 
 
 def main():
+    global CONFIDENCE_THRESHOLD, MIN_FACE_SIZE, MAX_FACE_ASPECT_RATIO, VEHICLE_CONFIDENCE
     ensure_dir(OUTPUT_DIR)
 
     urls = [u.strip() for u in RTSP_URLS if u.strip()]
@@ -751,15 +824,30 @@ def main():
 
     WINDOW_CAMERAS = "Face Tracker"
     WINDOW_DASHBOARD = "Dashboard"
+    WINDOW_SETTINGS = "Settings"
 
     cv2.namedWindow(WINDOW_CAMERAS, cv2.WINDOW_NORMAL)
     cv2.namedWindow(WINDOW_DASHBOARD, cv2.WINDOW_NORMAL)
+    cv2.namedWindow(WINDOW_SETTINGS, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(WINDOW_SETTINGS, 420, 1)
+
+    # -- Trackbars for real-time tuning --
+    conf_init = int(CONFIDENCE_THRESHOLD * 100)
+    cv2.createTrackbar("Face Conf %", WINDOW_SETTINGS, conf_init, 95, lambda v: None)
+    cv2.setTrackbarMin("Face Conf %", WINDOW_SETTINGS, 10)
+    cv2.createTrackbar("Min Face px", WINDOW_SETTINGS, MIN_FACE_SIZE, 200, lambda v: None)
+    cv2.setTrackbarMin("Min Face px", WINDOW_SETTINGS, 10)
+    ar_init = int(MAX_FACE_ASPECT_RATIO * 10)
+    cv2.createTrackbar("Aspect x10", WINDOW_SETTINGS, ar_init, 50, lambda v: None)
+    cv2.setTrackbarMin("Aspect x10", WINDOW_SETTINGS, 10)
+    vconf_init = int(VEHICLE_CONFIDENCE * 100)
+    cv2.createTrackbar("Veh Conf %", WINDOW_SETTINGS, vconf_init, 95, lambda v: None)
+    cv2.setTrackbarMin("Veh Conf %", WINDOW_SETTINGS, 10)
 
     # Mouse callback for dashboard interaction
     def on_dashboard_click(event, x, y, flags, param):
         if event == cv2.EVENT_LBUTTONDOWN:
-            # Check for History button click (approx coords based on render)
-            # Button is at (width-80, 10) to (width-10, 36) -> (340, 10) to (410, 36) for width=420
+            # Check for History button click
             if 340 <= x <= 410 and 10 <= y <= 36:
                 stats.generate_report()
                 return
@@ -768,6 +856,12 @@ def main():
             if target_path:
                 print(f"[UI] Opening detail view for: {target_path}")
                 show_detail_window(target_path)
+
+        elif event == cv2.EVENT_RBUTTONDOWN:
+            # Right-click = mark false positive
+            item_type, idx, item = stats.get_fp_target(x, y)
+            if item_type is not None:
+                stats.mark_false_positive(item_type, item)
 
     cv2.setMouseCallback(WINDOW_DASHBOARD, on_dashboard_click)
 
@@ -790,11 +884,38 @@ def main():
                     display = cv2.resize(display, (0, 0), fx=scale, fy=scale)
                 cv2.imshow(WINDOW_CAMERAS, display)
 
+            # -- Read trackbar values and update globals --
+            try:
+                new_conf = cv2.getTrackbarPos("Face Conf %", WINDOW_SETTINGS) / 100.0
+                new_min = cv2.getTrackbarPos("Min Face px", WINDOW_SETTINGS)
+                new_ar = cv2.getTrackbarPos("Aspect x10", WINDOW_SETTINGS) / 10.0
+                new_vconf = cv2.getTrackbarPos("Veh Conf %", WINDOW_SETTINGS) / 100.0
+
+                if new_conf != CONFIDENCE_THRESHOLD:
+                    CONFIDENCE_THRESHOLD = new_conf
+                    face_detector.detector.setScoreThreshold(new_conf)
+                MIN_FACE_SIZE = new_min
+                MAX_FACE_ASPECT_RATIO = new_ar
+                if new_vconf != VEHICLE_CONFIDENCE:
+                    VEHICLE_CONFIDENCE = new_vconf
+
+                # Render settings info bar
+                settings_bar = np.zeros((30, 420, 3), dtype=np.uint8)
+                settings_bar[:] = COL_BG
+                info = f"Conf:{CONFIDENCE_THRESHOLD:.0%}  Size:{MIN_FACE_SIZE}px  AR:{MAX_FACE_ASPECT_RATIO:.1f}  VehConf:{VEHICLE_CONFIDENCE:.0%}"
+                cv2.putText(settings_bar, info, (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.38, COL_ACCENT, 1)
+                cv2.imshow(WINDOW_SETTINGS, settings_bar)
+            except cv2.error:
+                pass  # Settings window was closed
+
             # Render dashboard
             snapshot = stats.get_snapshot()
             snapshot['queue_size'] = enhancer.queue.qsize()
             dashboard = render_dashboard(snapshot, width=420, height=720)
             cv2.imshow(WINDOW_DASHBOARD, dashboard)
+
+            # Store rendered lists for accurate click targeting
+            stats.store_rendered(snapshot['recent_faces'], snapshot['recent_vehicles'])
 
             key = cv2.waitKey(30) & 0xFF
             if key == ord('q'):
