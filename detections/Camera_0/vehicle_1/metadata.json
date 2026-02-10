@@ -1,0 +1,13 @@
+{
+    "vehicle_id": 1,
+    "class": "bus",
+    "camera": "Camera_0",
+    "timestamp": "20260210_160040_816471",
+    "bbox": [
+        207,
+        323,
+        193,
+        379
+    ],
+    "confidence": 0.5827275514602661
+}

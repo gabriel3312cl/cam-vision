@@ -11,6 +11,8 @@ Real-time multi-camera face and vehicle detection, tracking, and capture system 
 - **Persistent ID Tracking** -- Independent centroid trackers for faces and vehicles
 - **One-Shot Capture** -- Saves one image per detected person/vehicle, avoids duplicate captures
 - **Live Dashboard** -- Real-time stats window with recent captures, totals, and per-camera breakdown
+- **Image Enhancement** -- Automatic background enhancement (upscale + sharpening) for all captures
+- **Interactive Detail View** -- Click any recent item on the dashboard to see Original vs Enhanced comparison
 - **Configurable via Environment** -- All parameters tunable through `.env` without code changes
 - **Threaded Architecture** -- Non-blocking video capture with per-camera processing threads
 
