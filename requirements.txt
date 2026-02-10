@@ -1,0 +1,6 @@
+opencv-python
+mediapipe
+python-dotenv
+numpy
+scipy
+

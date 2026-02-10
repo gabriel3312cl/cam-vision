@@ -1,0 +1,29 @@
+# Environment
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environments
+venv/
+.venv/
+
+# Models (large binary files)
+src/models/*.onnx
+
+# Captures output
+rostros_detectados/
+
+# Debug files
+debug_stream.py
+dummy_stream.mp4
+
+# IDE
+.vscode/
+.idea/
