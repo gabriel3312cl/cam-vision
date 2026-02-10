@@ -18,7 +18,7 @@ venv/
 src/models/*.onnx
 
 # Captures output
-rostros_detectados/
+detections/
 
 # Debug files
 debug_stream.py
