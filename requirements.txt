@@ -1,6 +1,5 @@
 opencv-python
-mediapipe
 python-dotenv
 numpy
 scipy
-
+onnxruntime-directml
