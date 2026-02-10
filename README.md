@@ -1,43 +1,48 @@
 # Cam-Vision
 
-Real-time multi-camera face detection, tracking, and capture system built with Python. Processes RTSP streams from IP cameras, detects faces using YuNet (deep learning), assigns persistent IDs to tracked individuals, and saves cropped face and body images with structured metadata.
+Real-time multi-camera face and vehicle detection, tracking, and capture system built with Python. Processes RTSP streams from IP cameras, detects faces (YuNet) and vehicles (YOLOv8n), assigns persistent IDs to each tracked object, and saves cropped images with structured metadata.
 
 ## Features
 
 - **Multi-Camera Support** -- Process N cameras simultaneously, each with independent tracking
-- **GPU-Accelerated Inference** -- Face detection runs on GPU via ONNX Runtime with DirectML (NVIDIA, AMD, Intel)
-- **Persistent ID Tracking** -- Centroid-based tracker assigns unique IDs to individuals across frames
-- **One-Shot Capture** -- Saves one face and body crop per person, avoids duplicate captures
-- **False Positive Filtering** -- Landmark validation, aspect ratio checks, and minimum size thresholds
+- **GPU-Accelerated Inference** -- Both detectors run on GPU via ONNX Runtime with DirectML (NVIDIA, AMD, Intel)
+- **Face Detection** -- YuNet deep learning model with landmark validation and false positive filtering
+- **Vehicle Detection** -- YOLOv8n model detecting cars, motorcycles, buses, and trucks
+- **Persistent ID Tracking** -- Independent centroid trackers for faces and vehicles
+- **One-Shot Capture** -- Saves one image per detected person/vehicle, avoids duplicate captures
+- **Live Dashboard** -- Real-time stats window with recent captures, totals, and per-camera breakdown
 - **Configurable via Environment** -- All parameters tunable through `.env` without code changes
 - **Threaded Architecture** -- Non-blocking video capture with per-camera processing threads
 
 ## Architecture
 
 ```
-                    +-------------------+
-                    |   Shared GPU      |
-                    |   FaceDetectorGPU |
-                    |   (ONNX Runtime)  |
-                    +--------+----------+
-                             |
-              +--------------+--------------+
-              |              |              |
-     +--------v---+  +------v-----+  +-----v------+
-     | Camera 0   |  | Camera 1   |  | Camera N   |
-     | VideoStream|  | VideoStream|  | VideoStream|
-     | Tracker    |  | Tracker    |  | Tracker    |
-     | Capture    |  | Capture    |  | Capture    |
-     +------------+  +------------+  +------------+
+         +------------------+   +---------------------+
+         | FaceDetectorGPU  |   | VehicleDetectorGPU  |
+         | (YuNet ONNX)     |   | (YOLOv8n ONNX)      |
+         +--------+---------+   +----------+----------+
+                  |         Shared GPU Lock  |
+                  +------------+-------------+
+                               |
+                +--------------+--------------+
+                |              |              |
+       +--------v---+  +------v-----+  +-----v------+
+       | Camera 0   |  | Camera 1   |  | Camera N   |
+       | VideoStream|  | VideoStream|  | VideoStream|
+       | FaceTracker|  | FaceTracker|  | FaceTracker|
+       | VehTracker |  | VehTracker |  | VehTracker |
+       | Capture    |  | Capture    |  | Capture    |
+       +------------+  +------------+  +------------+
 ```
 
-Each camera runs in its own thread with a dedicated tracker and capture pipeline. All cameras share a single GPU-backed face detector instance (thread-safe).
+Each camera runs in its own thread with dedicated face and vehicle trackers. Both detectors share a single GPU lock to serialize DirectML inference calls.
 
 ## Tech Stack
 
 | Component | Technology |
 |---|---|
 | Face Detection | YuNet (ONNX, 2023) |
+| Vehicle Detection | YOLOv8n (ONNX, COCO) |
 | GPU Inference | ONNX Runtime + DirectML |
 | Video Capture | OpenCV + FFmpeg (RTSP/TCP) |
 | Tracking | Centroid-based tracker with scipy |
@@ -93,10 +98,13 @@ CAMERA_NAMES=FrontDoor,Backyard
 |---|---|---|
 | `RTSP_URLS` | -- | Comma-separated RTSP stream URLs (required) |
 | `CAMERA_NAMES` | `Camera_0` | Display names for each camera |
-| `CONFIDENCE_THRESHOLD` | `0.85` | Minimum detection confidence (0.0 - 1.0) |
+| `CONFIDENCE_THRESHOLD` | `0.85` | Minimum face detection confidence |
 | `MIN_FACE_SIZE` | `40` | Minimum face size in pixels |
 | `MAX_FACE_ASPECT_RATIO` | `2.0` | Maximum width/height ratio for valid faces |
-| `TRACKING_DISTANCE` | `50` | Max centroid movement in pixels between frames |
+| `TRACKING_DISTANCE` | `50` | Max centroid movement for face tracking |
+| `VEHICLE_CONFIDENCE` | `0.5` | Minimum vehicle detection confidence |
+| `VEHICLE_MIN_SIZE` | `60` | Minimum vehicle bbox size in pixels |
+| `VEHICLE_TRACKING_DISTANCE` | `80` | Max centroid movement for vehicle tracking |
 | `TARGET_FPS` | `10` | Detection processing rate per camera |
 | `OUTPUT_DIR` | `rostros_detectados` | Root directory for captured images |
 
@@ -116,9 +124,11 @@ The live video feed displays:
 
 | Indicator | Meaning |
 |---|---|
-| Green box + `ID X` | Newly detected person, not yet captured |
-| Cyan box + `ID X SAVED` | Person already captured |
-| Gray box + `REJECTED` | Detection filtered out by validation |
+| Green box + `ID X` | Newly detected face, not yet captured |
+| Cyan box + `ID X SAVED` | Face already captured |
+| Orange box + `V0 car` | Newly detected vehicle with class |
+| Yellow box + `V0 car SAVED` | Vehicle already captured |
+| Gray box | Detection filtered out by validation |
 | Red flash | Capture in progress |
 
 ### Output Structure
@@ -130,10 +140,15 @@ rostros_detectados/
       face.jpg            # Cropped face image
       body.jpg            # Estimated full body crop
       metadata.json       # Detection metadata
+    vehicle_0/
+      vehicle_crop.jpg    # Cropped vehicle image
+      metadata.json       # Vehicle metadata (class, bbox, confidence)
     person_1/
       ...
   Backyard/
     person_0/
+      ...
+    vehicle_0/
       ...
 ```
 
@@ -157,25 +172,31 @@ cam-vision/
   requirements.txt          # Python dependencies
   src/
     main.py                 # Entry point, multi-camera orchestration
-    face_detector.py        # YuNet detector with GPU acceleration
+    face_detector.py        # YuNet face detector with GPU acceleration
+    vehicle_detector.py     # YOLOv8n vehicle detector with GPU acceleration
     video_stream.py         # Threaded RTSP capture
     tracker.py              # Centroid-based ID tracker
     utils.py                # File I/O and metadata helpers
     models/
       face_detection_yunet_2023mar.onnx
+      yolov8n.onnx
 ```
 
 ## How It Works
 
 1. **Video Capture** -- Each camera URL spawns a `VideoStream` thread that continuously reads frames over RTSP (TCP transport for reliability). The main thread always gets the latest frame without blocking.
 
-2. **Face Detection** -- Frames are resized to 640x640 and fed to the YuNet model via ONNX Runtime. The model outputs bounding boxes, confidence scores, and facial landmarks (eyes, nose, mouth) at three scales. A post-processing pipeline decodes anchor-based predictions and applies non-maximum suppression.
+2. **Face Detection** -- Frames are resized to 640x640 and fed to the YuNet model via ONNX Runtime. The model outputs bounding boxes, confidence scores, and facial landmarks at three scales. Post-processing decodes anchor-based predictions and applies NMS.
 
-3. **Validation** -- Each detection passes through filters: minimum size, aspect ratio, and landmark consistency (all five landmarks must fall within the bounding box, and eye distance must be proportional to face width). This eliminates false positives from foliage, shadows, and textures.
+3. **Vehicle Detection** -- The same frame is also processed by YOLOv8n, which detects cars, motorcycles, buses, and trucks. The model uses letterbox preprocessing and standard YOLOv8 post-processing with class filtering.
 
-4. **Tracking** -- A centroid tracker matches detections across frames using euclidean distance. Each person receives a unique ID that persists as long as they remain visible. IDs are released after a configurable number of frames without a match.
+4. **Validation** -- Face detections pass through filters: minimum size, aspect ratio, and landmark consistency. Vehicle detections are filtered by confidence and minimum size.
 
-5. **Capture** -- On first detection, the system saves a cropped face image, an estimated body crop (heuristic extrapolation from face position), and a JSON metadata file. Each person is captured exactly once per session.
+5. **Tracking** -- Independent centroid trackers match face and vehicle detections across frames. Each object receives a unique ID that persists as long as it remains visible.
+
+6. **Capture** -- On first detection, the system saves cropped images and JSON metadata. Faces get face + body crops; vehicles get a vehicle crop with class label. Each object is captured exactly once per session.
+
+7. **Dashboard** -- A live stats window displays total captures, per-camera breakdown, active tracking counts, and thumbnails of the last 5 captured faces and vehicles.
 
 ## Performance
 

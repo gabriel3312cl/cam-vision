@@ -11,6 +11,7 @@ from dotenv import load_dotenv
 from video_stream import VideoStream
 from tracker import CentroidTracker
 from face_detector import FaceDetectorGPU
+from vehicle_detector import VehicleDetectorGPU
 from utils import ensure_dir, save_image, log_metadata, get_timestamp
 
 # Load environment variables
@@ -25,13 +26,19 @@ MIN_FACE_SIZE = int(os.getenv("MIN_FACE_SIZE", 40))
 MAX_FACE_ASPECT_RATIO = float(os.getenv("MAX_FACE_ASPECT_RATIO", 2.0))
 TARGET_FPS = int(os.getenv("TARGET_FPS", 10))
 
-MODEL_PATH = os.path.join(os.path.dirname(__file__), "models", "face_detection_yunet_2023mar.onnx")
+# Vehicle settings
+VEHICLE_CONFIDENCE = float(os.getenv("VEHICLE_CONFIDENCE", 0.5))
+VEHICLE_MIN_SIZE = int(os.getenv("VEHICLE_MIN_SIZE", 60))
+VEHICLE_TRACKING_DISTANCE = int(os.getenv("VEHICLE_TRACKING_DISTANCE", 80))
+
+MODEL_DIR = os.path.join(os.path.dirname(__file__), "models")
+FACE_MODEL_PATH = os.path.join(MODEL_DIR, "face_detection_yunet_2023mar.onnx")
+VEHICLE_MODEL_PATH = os.path.join(MODEL_DIR, "yolov8n.onnx")
 
 while len(CAMERA_NAMES) < len(RTSP_URLS):
     CAMERA_NAMES.append(f"Camera_{len(CAMERA_NAMES)}")
 
 shutdown_event = threading.Event()
-
 
 # -- Colors (BGR) --
 COL_BG       = (30, 30, 30)
@@ -42,6 +49,8 @@ COL_DIM      = (140, 140, 140)
 COL_ACCENT   = (255, 200, 60)
 COL_GREEN    = (80, 200, 80)
 COL_CYAN     = (200, 200, 0)
+COL_ORANGE   = (0, 140, 255)
+COL_YELLOW   = (0, 220, 255)
 
 
 def is_valid_face(x, y, w_box, h_box, landmarks):
@@ -68,131 +77,169 @@ class StatsTracker:
     def __init__(self, max_recent=5):
         self.lock = threading.Lock()
         self.max_recent = max_recent
-        self.recent_captures = deque(maxlen=max_recent)  # (face_img, camera, person_id, timestamp)
-        self.total_captures = 0
-        self.captures_per_camera = {}
+        # Face stats
+        self.recent_faces = deque(maxlen=max_recent)
+        self.total_faces = 0
+        self.faces_per_camera = {}
+        # Vehicle stats
+        self.recent_vehicles = deque(maxlen=max_recent)
+        self.total_vehicles = 0
+        self.vehicles_per_camera = {}
+        self.vehicle_classes_count = {}  # class_name -> count
+        # Tracking
+        self.active_face_tracks = {}
+        self.active_vehicle_tracks = {}
         self.start_time = time.time()
-        self.active_tracks = {}  # camera -> count of currently tracked objects
 
-    def record_capture(self, face_img, camera_name, person_id):
-        """Record a new capture event."""
+    def record_face(self, face_img, camera_name, person_id):
         with self.lock:
-            thumb = cv2.resize(face_img, (80, 80)) if face_img.size > 0 else np.zeros((80,80,3), dtype=np.uint8)
-            self.recent_captures.append({
+            thumb = cv2.resize(face_img, (64, 64)) if face_img.size > 0 else np.zeros((64, 64, 3), dtype=np.uint8)
+            self.recent_faces.append({
                 'thumb': thumb,
                 'camera': camera_name,
-                'person_id': person_id,
+                'id': person_id,
                 'time': datetime.now().strftime("%H:%M:%S"),
             })
-            self.total_captures += 1
-            self.captures_per_camera[camera_name] = self.captures_per_camera.get(camera_name, 0) + 1
+            self.total_faces += 1
+            self.faces_per_camera[camera_name] = self.faces_per_camera.get(camera_name, 0) + 1
 
-    def update_active_tracks(self, camera_name, count):
-        """Update the number of currently active tracks for a camera."""
+    def record_vehicle(self, vehicle_img, camera_name, vehicle_id, class_name):
         with self.lock:
-            self.active_tracks[camera_name] = count
+            thumb = cv2.resize(vehicle_img, (96, 64)) if vehicle_img.size > 0 else np.zeros((64, 96, 3), dtype=np.uint8)
+            self.recent_vehicles.append({
+                'thumb': thumb,
+                'camera': camera_name,
+                'id': vehicle_id,
+                'class': class_name,
+                'time': datetime.now().strftime("%H:%M:%S"),
+            })
+            self.total_vehicles += 1
+            self.vehicles_per_camera[camera_name] = self.vehicles_per_camera.get(camera_name, 0) + 1
+            self.vehicle_classes_count[class_name] = self.vehicle_classes_count.get(class_name, 0) + 1
+
+    def update_active_tracks(self, camera_name, face_count, vehicle_count):
+        with self.lock:
+            self.active_face_tracks[camera_name] = face_count
+            self.active_vehicle_tracks[camera_name] = vehicle_count
 
     def get_snapshot(self):
-        """Return a copy of current stats."""
         with self.lock:
             return {
-                'recent': list(self.recent_captures),
-                'total': self.total_captures,
-                'per_camera': dict(self.captures_per_camera),
-                'active_tracks': dict(self.active_tracks),
+                'recent_faces': list(self.recent_faces),
+                'recent_vehicles': list(self.recent_vehicles),
+                'total_faces': self.total_faces,
+                'total_vehicles': self.total_vehicles,
+                'faces_per_cam': dict(self.faces_per_camera),
+                'vehicles_per_cam': dict(self.vehicles_per_camera),
+                'vehicle_classes': dict(self.vehicle_classes_count),
+                'active_faces': dict(self.active_face_tracks),
+                'active_vehicles': dict(self.active_vehicle_tracks),
                 'uptime': time.time() - self.start_time,
             }
 
 
-def render_dashboard(stats, width=400, height=600):
+def _draw_text(img, text, pos, scale=0.42, color=COL_TEXT, thickness=1):
+    cv2.putText(img, text, pos, cv2.FONT_HERSHEY_SIMPLEX, scale, color, thickness)
+
+
+def render_dashboard(stats, width=420, height=720):
     """Render the stats dashboard as an image."""
     dash = np.full((height, width, 3), COL_BG, dtype=np.uint8)
     y = 0
 
     # -- Header --
-    header_h = 50
-    cv2.rectangle(dash, (0, 0), (width, header_h), COL_PANEL, -1)
-    cv2.putText(dash, "DETECTION DASHBOARD", (15, 33),
-        cv2.FONT_HERSHEY_SIMPLEX, 0.65, COL_ACCENT, 2)
-    y = header_h + 10
+    cv2.rectangle(dash, (0, 0), (width, 46), COL_PANEL, -1)
+    _draw_text(dash, "DETECTION DASHBOARD", (15, 30), 0.6, COL_ACCENT, 2)
+    y = 56
 
-    # -- Uptime --
-    uptime_s = int(stats['uptime'])
-    hours, remainder = divmod(uptime_s, 3600)
-    minutes, seconds = divmod(remainder, 60)
-    uptime_str = f"{hours:02d}:{minutes:02d}:{seconds:02d}"
-    cv2.putText(dash, f"Uptime: {uptime_str}", (15, y + 18),
-        cv2.FONT_HERSHEY_SIMPLEX, 0.45, COL_DIM, 1)
-    y += 30
-
-    # -- Separator --
-    cv2.line(dash, (15, y), (width - 15, y), COL_BORDER, 1)
-    y += 15
-
-    # -- Total captures --
-    cv2.putText(dash, "TOTAL CAPTURES", (15, y + 16),
-        cv2.FONT_HERSHEY_SIMPLEX, 0.45, COL_DIM, 1)
+    # Uptime
+    up = int(stats['uptime'])
+    _draw_text(dash, f"Uptime: {up // 3600:02d}:{(up % 3600) // 60:02d}:{up % 60:02d}", (15, y), 0.4, COL_DIM)
     y += 25
-    cv2.putText(dash, str(stats['total']), (15, y + 35),
-        cv2.FONT_HERSHEY_SIMPLEX, 1.3, COL_ACCENT, 2)
-    y += 50
 
-    # -- Per camera stats --
+    # -- Totals --
     cv2.line(dash, (15, y), (width - 15, y), COL_BORDER, 1)
-    y += 15
-    cv2.putText(dash, "PER CAMERA", (15, y + 16),
-        cv2.FONT_HERSHEY_SIMPLEX, 0.45, COL_DIM, 1)
+    y += 18
+    _draw_text(dash, "TOTALS", (15, y), 0.4, COL_DIM)
+    y += 22
+
+    # Faces total
+    _draw_text(dash, f"Faces:", (20, y), 0.5, COL_TEXT)
+    _draw_text(dash, str(stats['total_faces']), (110, y), 0.5, COL_GREEN, 2)
+    # Vehicles total
+    _draw_text(dash, f"Vehicles:", (210, y), 0.5, COL_TEXT)
+    _draw_text(dash, str(stats['total_vehicles']), (330, y), 0.5, COL_ORANGE, 2)
     y += 28
 
-    for cam_name in sorted(set(list(stats['per_camera'].keys()) + list(stats['active_tracks'].keys()))):
-        captures = stats['per_camera'].get(cam_name, 0)
-        active = stats['active_tracks'].get(cam_name, 0)
+    # Vehicle class breakdown
+    if stats['vehicle_classes']:
+        classes_str = "  ".join([f"{name}: {cnt}" for name, cnt in sorted(stats['vehicle_classes'].items())])
+        _draw_text(dash, classes_str, (20, y), 0.35, COL_DIM)
+        y += 20
 
-        cv2.putText(dash, cam_name, (20, y + 15),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.5, COL_TEXT, 1)
-        cv2.putText(dash, f"Saved: {captures}", (160, y + 15),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.42, COL_GREEN, 1)
-        cv2.putText(dash, f"Tracking: {active}", (280, y + 15),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.42, COL_CYAN, 1)
-        y += 25
-
-    y += 10
-
-    # -- Recent captures --
+    # -- Per camera --
     cv2.line(dash, (15, y), (width - 15, y), COL_BORDER, 1)
-    y += 15
-    cv2.putText(dash, "RECENT CAPTURES", (15, y + 16),
-        cv2.FONT_HERSHEY_SIMPLEX, 0.45, COL_DIM, 1)
-    y += 30
+    y += 18
+    _draw_text(dash, "PER CAMERA", (15, y), 0.4, COL_DIM)
+    y += 22
 
-    recent = stats['recent']
-    if not recent:
-        cv2.putText(dash, "No captures yet", (20, y + 15),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.42, COL_DIM, 1)
-    else:
-        thumb_size = 64
-        padding = 8
-        for entry in reversed(recent):
-            if y + thumb_size + padding > height - 10:
-                break
+    all_cams = sorted(set(
+        list(stats['faces_per_cam'].keys()) + list(stats['vehicles_per_cam'].keys()) +
+        list(stats['active_faces'].keys()) + list(stats['active_vehicles'].keys())
+    ))
+    for cam in all_cams:
+        f_saved = stats['faces_per_cam'].get(cam, 0)
+        v_saved = stats['vehicles_per_cam'].get(cam, 0)
+        f_track = stats['active_faces'].get(cam, 0)
+        v_track = stats['active_vehicles'].get(cam, 0)
 
-            thumb = cv2.resize(entry['thumb'], (thumb_size, thumb_size))
+        _draw_text(dash, cam, (20, y + 12), 0.45, COL_TEXT)
+        _draw_text(dash, f"F:{f_saved}/{f_track}t", (140, y + 12), 0.35, COL_GREEN)
+        _draw_text(dash, f"V:{v_saved}/{v_track}t", (240, y + 12), 0.35, COL_ORANGE)
+        y += 22
+    y += 8
 
-            # Border
-            cv2.rectangle(dash, (14, y - 1), (15 + thumb_size + 1, y + thumb_size + 1), COL_BORDER, 1)
-            # Thumbnail
-            dash[y:y + thumb_size, 15:15 + thumb_size] = thumb
+    # -- Recent faces --
+    cv2.line(dash, (15, y), (width - 15, y), COL_BORDER, 1)
+    y += 18
+    _draw_text(dash, "RECENT FACES", (15, y), 0.4, COL_DIM)
+    y += 8
 
-            # Info text
-            tx = 15 + thumb_size + 12
-            cv2.putText(dash, f"Person {entry['person_id']}", (tx, y + 18),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.48, COL_TEXT, 1)
-            cv2.putText(dash, entry['camera'], (tx, y + 38),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.38, COL_GREEN, 1)
-            cv2.putText(dash, entry['time'], (tx, y + 55),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.38, COL_DIM, 1)
+    thumb_h = 52
+    for entry in reversed(stats['recent_faces']):
+        if y + thumb_h + 6 > height - 160:
+            break
+        y += 4
+        thumb = cv2.resize(entry['thumb'], (thumb_h, thumb_h))
+        cv2.rectangle(dash, (14, y - 1), (16 + thumb_h, y + thumb_h + 1), COL_BORDER, 1)
+        dash[y:y + thumb_h, 15:15 + thumb_h] = thumb
+        tx = 15 + thumb_h + 10
+        _draw_text(dash, f"Person {entry['id']}", (tx, y + 16), 0.42, COL_TEXT)
+        _draw_text(dash, entry['camera'], (tx, y + 32), 0.35, COL_GREEN)
+        _draw_text(dash, entry['time'], (tx, y + 46), 0.32, COL_DIM)
+        y += thumb_h + 4
 
-            y += thumb_size + padding + 4
+    y += 8
+
+    # -- Recent vehicles --
+    cv2.line(dash, (15, y), (width - 15, y), COL_BORDER, 1)
+    y += 18
+    _draw_text(dash, "RECENT VEHICLES", (15, y), 0.4, COL_DIM)
+    y += 8
+
+    vthumb_w, vthumb_h = 80, 52
+    for entry in reversed(stats['recent_vehicles']):
+        if y + vthumb_h + 6 > height - 10:
+            break
+        y += 4
+        thumb = cv2.resize(entry['thumb'], (vthumb_w, vthumb_h))
+        cv2.rectangle(dash, (14, y - 1), (16 + vthumb_w, y + vthumb_h + 1), COL_BORDER, 1)
+        dash[y:y + vthumb_h, 15:15 + vthumb_w] = thumb
+        tx = 15 + vthumb_w + 10
+        _draw_text(dash, f"Vehicle {entry['id']} ({entry['class']})", (tx, y + 16), 0.42, COL_TEXT)
+        _draw_text(dash, entry['camera'], (tx, y + 32), 0.35, COL_ORANGE)
+        _draw_text(dash, entry['time'], (tx, y + 46), 0.32, COL_DIM)
+        y += vthumb_h + 4
 
     return dash
 
@@ -200,17 +247,24 @@ def render_dashboard(stats, width=400, height=600):
 class CameraProcessor:
     """Encapsulates one camera's processing loop."""
 
-    def __init__(self, cam_id, name, url, detector, output_dir, stats):
+    def __init__(self, cam_id, name, url, face_detector, vehicle_detector, output_dir, stats):
         self.cam_id = cam_id
         self.name = name
         self.url = url
-        self.detector = detector
+        self.face_detector = face_detector
+        self.vehicle_detector = vehicle_detector
         self.stats = stats
         self.output_dir = os.path.join(output_dir, name)
         ensure_dir(self.output_dir)
 
-        self.tracker = CentroidTracker(maxDisappeared=40, maxDistance=TRACKING_DISTANCE)
-        self.object_captures = {}
+        # Face tracking
+        self.face_tracker = CentroidTracker(maxDisappeared=40, maxDistance=TRACKING_DISTANCE)
+        self.face_captures = {}
+
+        # Vehicle tracking
+        self.vehicle_tracker = CentroidTracker(maxDisappeared=30, maxDistance=VEHICLE_TRACKING_DISTANCE)
+        self.vehicle_captures = {}
+
         self.display_frame = None
         self.lock = threading.Lock()
         self.stopped = False
@@ -237,6 +291,146 @@ class CameraProcessor:
         if not self.stopped:
             self.thread.start()
 
+    def _process_faces(self, frame, rects_out):
+        """Detect and process faces. Appends face rects to rects_out."""
+        detections = self.face_detector.detect(frame)
+
+        for det in detections:
+            x, y, fw, fh = det['bbox']
+            landmarks = det['landmarks']
+            x = max(0, x)
+            y = max(0, y)
+            fw = min(self.frame_w - x, fw)
+            fh = min(self.frame_h - y, fh)
+
+            if det['confidence'] < CONFIDENCE_THRESHOLD:
+                continue
+            if not is_valid_face(x, y, fw, fh, landmarks):
+                cv2.rectangle(frame, (x, y), (x + fw, y + fh), (128, 128, 128), 1)
+                continue
+
+            rects_out.append((x, y, x + fw, y + fh))
+
+        objects = self.face_tracker.update(rects_out)
+
+        for (objectID, centroid) in objects.items():
+            best_rect = None
+            min_dist = float('inf')
+            for rect in rects_out:
+                rx, ry, rx2, ry2 = rect
+                d = np.linalg.norm(np.array([(rx + rx2) // 2, (ry + ry2) // 2]) - centroid)
+                if d < min_dist:
+                    min_dist = d
+                    best_rect = rect
+
+            if best_rect:
+                x, y, x2, y2 = best_rect
+                w_curr, h_curr = x2 - x, y2 - y
+
+                if objectID in self.face_captures:
+                    cv2.rectangle(frame, (x, y), (x2, y2), COL_CYAN, 2)
+                    cv2.putText(frame, f"ID {objectID} SAVED", (x, y - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, COL_CYAN, 2)
+                else:
+                    cv2.rectangle(frame, (x, y), (x2, y2), (0, 255, 0), 2)
+                    cv2.putText(frame, f"ID {objectID}", (x, y - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+
+                    person_dir = os.path.join(self.output_dir, f"person_{objectID}")
+                    ensure_dir(person_dir)
+                    timestamp = get_timestamp()
+
+                    face_img = frame[y:y2, x:x2]
+                    if face_img.size > 0:
+                        save_image(face_img, os.path.join(person_dir, "face.jpg"))
+                        self.stats.record_face(face_img, self.name, objectID)
+
+                    bx_center = x + w_curr // 2
+                    by_start = max(0, y - int(h_curr * 0.5))
+                    by_end = min(self.frame_h, y + int(h_curr * 5))
+                    bx_start = max(0, bx_center - int(w_curr * 1.5))
+                    bx_end = min(self.frame_w, bx_center + int(w_curr * 1.5))
+                    body_img = frame[by_start:by_end, bx_start:bx_end]
+                    if body_img.size > 0:
+                        save_image(body_img, os.path.join(person_dir, "body.jpg"))
+
+                    log_metadata({
+                        "person_id": objectID, "camera": self.name,
+                        "timestamp": timestamp, "face_bbox": [x, y, w_curr, h_curr],
+                    }, os.path.join(person_dir, "metadata.json"))
+                    self.face_captures[objectID] = True
+                    cv2.rectangle(frame, (x, y), (x2, y2), (0, 0, 255), 3)
+                    print(f"[CAM {self.cam_id}] Captured Person {objectID}")
+            else:
+                cv2.circle(frame, (centroid[0], centroid[1]), 4, (0, 165, 255), -1)
+
+        return len(objects)
+
+    def _process_vehicles(self, frame):
+        """Detect and process vehicles."""
+        detections = self.vehicle_detector.detect(frame)
+        vrects = []
+        det_info = {}  # map rect -> detection info
+
+        for det in detections:
+            x, y, fw, fh = det['bbox']
+            x = max(0, x)
+            y = max(0, y)
+            fw = min(self.frame_w - x, fw)
+            fh = min(self.frame_h - y, fh)
+            rect = (x, y, x + fw, y + fh)
+            vrects.append(rect)
+            det_info[rect] = det
+
+        objects = self.vehicle_tracker.update(vrects)
+
+        for (objectID, centroid) in objects.items():
+            best_rect = None
+            min_dist = float('inf')
+            for rect in vrects:
+                rx, ry, rx2, ry2 = rect
+                d = np.linalg.norm(np.array([(rx + rx2) // 2, (ry + ry2) // 2]) - centroid)
+                if d < min_dist:
+                    min_dist = d
+                    best_rect = rect
+
+            if best_rect:
+                x, y, x2, y2 = best_rect
+                det = det_info.get(best_rect, {})
+                class_name = det.get('class_name', 'vehicle')
+
+                if objectID in self.vehicle_captures:
+                    cv2.rectangle(frame, (x, y), (x2, y2), COL_YELLOW, 2)
+                    cv2.putText(frame, f"V{objectID} {class_name} SAVED", (x, y - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, COL_YELLOW, 2)
+                else:
+                    cv2.rectangle(frame, (x, y), (x2, y2), COL_ORANGE, 2)
+                    cv2.putText(frame, f"V{objectID} {class_name}", (x, y - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, COL_ORANGE, 2)
+
+                    vehicle_dir = os.path.join(self.output_dir, f"vehicle_{objectID}")
+                    ensure_dir(vehicle_dir)
+                    timestamp = get_timestamp()
+
+                    vehicle_img = frame[y:y2, x:x2]
+                    if vehicle_img.size > 0:
+                        save_image(vehicle_img, os.path.join(vehicle_dir, "vehicle_crop.jpg"))
+                        self.stats.record_vehicle(vehicle_img, self.name, objectID, class_name)
+
+                    log_metadata({
+                        "vehicle_id": objectID, "class": class_name,
+                        "camera": self.name, "timestamp": timestamp,
+                        "bbox": [x, y, x2 - x, y2 - y],
+                        "confidence": det.get('confidence', 0),
+                    }, os.path.join(vehicle_dir, "metadata.json"))
+                    self.vehicle_captures[objectID] = True
+                    cv2.rectangle(frame, (x, y), (x2, y2), (0, 0, 255), 3)
+                    print(f"[CAM {self.cam_id}] Captured Vehicle {objectID} ({class_name})")
+            else:
+                cv2.circle(frame, (centroid[0], centroid[1]), 4, COL_ORANGE, -1)
+
+        return len(objects)
+
     def _process_loop(self):
         while not self.stopped and not shutdown_event.is_set():
             loop_start = time.time()
@@ -246,99 +440,11 @@ class CameraProcessor:
                 time.sleep(0.05)
                 continue
 
-            detections = self.detector.detect(frame)
-            rects = []
+            face_rects = []
+            face_count = self._process_faces(frame, face_rects)
+            vehicle_count = self._process_vehicles(frame)
 
-            for det in detections:
-                x, y, fw, fh = det['bbox']
-                confidence = det['confidence']
-                landmarks = det['landmarks']
-
-                x = max(0, x)
-                y = max(0, y)
-                fw = min(self.frame_w - x, fw)
-                fh = min(self.frame_h - y, fh)
-
-                if confidence < CONFIDENCE_THRESHOLD:
-                    continue
-                if not is_valid_face(x, y, fw, fh, landmarks):
-                    cv2.rectangle(frame, (x, y), (x + fw, y + fh), (128, 128, 128), 1)
-                    continue
-
-                rects.append((x, y, x + fw, y + fh))
-
-            objects = self.tracker.update(rects)
-
-            # Update active track count for stats
-            self.stats.update_active_tracks(self.name, len(objects))
-
-            for (objectID, centroid) in objects.items():
-                best_rect = None
-                min_dist = float('inf')
-
-                for rect in rects:
-                    rx, ry, rx2, ry2 = rect
-                    rcx = (rx + rx2) // 2
-                    rcy = (ry + ry2) // 2
-                    d = np.linalg.norm(np.array([rcx, rcy]) - centroid)
-                    if d < min_dist:
-                        min_dist = d
-                        best_rect = rect
-
-                already_captured = objectID in self.object_captures
-
-                if best_rect:
-                    x, y, x2, y2 = best_rect
-                    w_curr = x2 - x
-                    h_curr = y2 - y
-
-                    if already_captured:
-                        color = (255, 255, 0)
-                        label = f"ID {objectID} SAVED"
-                        cv2.rectangle(frame, (x, y), (x2, y2), color, 2)
-                        cv2.putText(frame, label, (x, y - 10),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
-                    else:
-                        color = (0, 255, 0)
-                        label = f"ID {objectID}"
-                        cv2.rectangle(frame, (x, y), (x2, y2), color, 2)
-                        cv2.putText(frame, label, (x, y - 10),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
-
-                        # Capture once
-                        person_dir = os.path.join(self.output_dir, f"person_{objectID}")
-                        ensure_dir(person_dir)
-                        timestamp = get_timestamp()
-
-                        face_img = frame[y:y2, x:x2]
-                        if face_img.size > 0:
-                            save_image(face_img, os.path.join(person_dir, "face.jpg"))
-                            # Push to stats dashboard
-                            self.stats.record_capture(face_img, self.name, objectID)
-
-                        bx_center = x + w_curr // 2
-                        by_start = max(0, y - int(h_curr * 0.5))
-                        by_end = min(self.frame_h, y + int(h_curr * 5))
-                        bx_start = max(0, bx_center - int(w_curr * 1.5))
-                        bx_end = min(self.frame_w, bx_center + int(w_curr * 1.5))
-
-                        body_img = frame[by_start:by_end, bx_start:bx_end]
-                        if body_img.size > 0:
-                            save_image(body_img, os.path.join(person_dir, "body.jpg"))
-
-                        metadata = {
-                            "person_id": objectID,
-                            "camera": self.name,
-                            "timestamp": timestamp,
-                            "face_bbox": [x, y, w_curr, h_curr],
-                            "score": w_curr * h_curr,
-                        }
-                        log_metadata(metadata, os.path.join(person_dir, "metadata.json"))
-                        self.object_captures[objectID] = True
-                        cv2.rectangle(frame, (x, y), (x2, y2), (0, 0, 255), 3)
-                        print(f"[CAM {self.cam_id}] Captured Person {objectID}")
-                else:
-                    cv2.circle(frame, (centroid[0], centroid[1]), 4, (0, 165, 255), -1)
+            self.stats.update_active_tracks(self.name, face_count, vehicle_count)
 
             cv2.putText(frame, self.name, (10, 30),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
@@ -394,15 +500,26 @@ def main():
 
     print(f"[INFO] Loading {len(urls)} camera(s)...")
 
-    # Shared stats tracker
     stats = StatsTracker(max_recent=5)
 
-    detector_input_size = (640, 640)
-    detector = FaceDetectorGPU(
-        model_path=MODEL_PATH,
-        input_size=detector_input_size,
+    # Shared lock to serialize GPU inference (prevents DirectML conflicts)
+    gpu_lock = threading.Lock()
+
+    face_detector = FaceDetectorGPU(
+        model_path=FACE_MODEL_PATH,
+        input_size=(640, 640),
         confidence_threshold=CONFIDENCE_THRESHOLD,
         nms_threshold=0.3,
+        gpu_lock=gpu_lock,
+    )
+
+    vehicle_detector = VehicleDetectorGPU(
+        model_path=VEHICLE_MODEL_PATH,
+        input_size=(640, 640),
+        confidence_threshold=VEHICLE_CONFIDENCE,
+        nms_threshold=0.45,
+        min_size=VEHICLE_MIN_SIZE,
+        gpu_lock=gpu_lock,
     )
 
     processors = []
@@ -410,7 +527,9 @@ def main():
         name = names[i] if i < len(names) else f"Camera_{i}"
         proc = CameraProcessor(
             cam_id=i, name=name, url=url,
-            detector=detector, output_dir=OUTPUT_DIR,
+            face_detector=face_detector,
+            vehicle_detector=vehicle_detector,
+            output_dir=OUTPUT_DIR,
             stats=stats,
         )
         if not proc.stopped:
@@ -431,7 +550,6 @@ def main():
 
     try:
         while not shutdown_event.is_set():
-            # Camera view
             frames = [proc.get_display_frame() for proc in processors]
 
             if len(processors) == 1 and frames[0] is not None:
@@ -444,9 +562,8 @@ def main():
 
             cv2.imshow(WINDOW_CAMERAS, display)
 
-            # Dashboard view
             snapshot = stats.get_snapshot()
-            dashboard = render_dashboard(snapshot, width=400, height=600)
+            dashboard = render_dashboard(snapshot, width=420, height=720)
             cv2.imshow(WINDOW_DASHBOARD, dashboard)
 
             key = cv2.waitKey(33) & 0xFF

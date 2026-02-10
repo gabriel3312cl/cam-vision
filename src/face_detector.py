@@ -13,11 +13,11 @@ class FaceDetectorGPU:
     STRIDES = [8, 16, 32]
 
     def __init__(self, model_path, input_size=(640, 640), confidence_threshold=0.85,
-                 nms_threshold=0.3):
+                 nms_threshold=0.3, gpu_lock=None):
         self.input_w, self.input_h = input_size
         self.confidence_threshold = confidence_threshold
         self.nms_threshold = nms_threshold
-        self.lock = threading.Lock()
+        self.lock = gpu_lock or threading.Lock()
 
         # Try GPU providers in order of preference
         available = ort.get_available_providers()
