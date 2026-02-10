@@ -18,7 +18,7 @@ venv/
 src/models/*.onnx
 
 # Captures output
-detections/
+./detections
 
 # Debug files
 debug_stream.py

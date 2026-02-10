@@ -159,7 +159,7 @@ class StatsTracker:
         print(f"[INFO] Report generated: {path}")
         webbrowser.open(f"file://{path}")
 
-    def record_face(self, face_img, camera_name, person_id):
+    def record_face(self, face_img, camera_name, person_id, path=None):
         with self.lock:
             thumb = cv2.resize(face_img, (64, 64)) if face_img.size > 0 else np.zeros((64, 64, 3), dtype=np.uint8)
             self.recent_faces.append({
@@ -167,12 +167,12 @@ class StatsTracker:
                 'camera': camera_name,
                 'id': person_id,
                 'time': datetime.now().strftime("%H:%M:%S"),
-                'face_path': None,  # Will be populated
+                'face_path': path,
             })
             self.total_faces += 1
             self.faces_per_camera[camera_name] = self.faces_per_camera.get(camera_name, 0) + 1
 
-    def record_vehicle(self, vehicle_img, camera_name, vehicle_id, class_name):
+    def record_vehicle(self, vehicle_img, camera_name, vehicle_id, class_name, path=None):
         with self.lock:
             thumb = cv2.resize(vehicle_img, (96, 64)) if vehicle_img.size > 0 else np.zeros((64, 96, 3), dtype=np.uint8)
             self.recent_vehicles.append({
@@ -180,9 +180,8 @@ class StatsTracker:
                 'camera': camera_name,
                 'id': vehicle_id,
                 'class': class_name,
-                'class': class_name,
                 'time': datetime.now().strftime("%H:%M:%S"),
-                'vehicle_path': None,  # Will be populated
+                'vehicle_path': path,
             })
             self.total_vehicles += 1
             self.vehicles_per_camera[camera_name] = self.vehicles_per_camera.get(camera_name, 0) + 1
@@ -249,11 +248,17 @@ def render_dashboard(stats, width=420, height=720):
 
     # -- Header --
     cv2.rectangle(dash, (0, 0), (width, 46), COL_PANEL, -1)
-    _draw_text(dash, "DETECTION DASHBOARD", (15, 30), 0.6, COL_ACCENT, 2)
+    _draw_text(dash, "DETECTION DASHBOARD", (10, 30), 0.5, COL_ACCENT, 2)
     # History button placeholder (visual only, click handled by coordinates)
     cv2.rectangle(dash, (width - 80, 10), (width - 10, 36), (60, 60, 60), -1)
     cv2.rectangle(dash, (width - 80, 10), (width - 10, 36), COL_BORDER, 1)
     _draw_text(dash, "HISTORY", (width - 72, 28), 0.4, COL_TEXT)
+    
+    # Enhancer Queue
+    q_size = stats.get('queue_size', 0)
+    col_q = COL_GREEN if q_size == 0 else (COL_ORANGE if q_size < 5 else (0, 0, 255))
+    _draw_text(dash, f"Enhance Q: {q_size}", (width - 170, 28), 0.4, col_q)
+    
     y = 56
 
     # Uptime
@@ -365,6 +370,7 @@ class CameraProcessor:
         self.vehicle_detector = vehicle_detector
         self.stats = stats
         self.enhancer = enhancer
+        self.fix_1080n = os.getenv("FIX_1080N_ASPECT_RATIO", "False").lower() == "true"
         self.output_dir = os.path.join(output_dir, name)
         ensure_dir(self.output_dir)
 
@@ -474,9 +480,7 @@ class CameraProcessor:
                             # Queue for enhancement
                             self.enhancer.process(face_path)
                             # Update stats with image content AND path
-                            self.stats.record_face(face_img, self.name, objectID)
-                            # We need to update the path of the most recent item we just added
-                            self.stats.update_recent_path('face', -1, face_path)
+                            self.stats.record_face(face_img, self.name, objectID, path=face_path)
 
                         bx_center = x + w_curr // 2
                         by_start = max(0, y - int(h_curr * 0.5))
@@ -581,9 +585,7 @@ class CameraProcessor:
                             save_image(vehicle_img, vehicle_path)
                             # Queue for enhancement
                             self.enhancer.process(vehicle_path)
-                            self.stats.record_vehicle(vehicle_img, self.name, objectID, class_name)
-                            # Update path for interaction
-                            self.stats.update_recent_path('vehicle', -1, vehicle_path)
+                            self.stats.record_vehicle(vehicle_img, self.name, objectID, class_name, path=vehicle_path)
 
                         log_metadata({
                             "vehicle_id": objectID, "class": class_name,
@@ -629,6 +631,10 @@ class CameraProcessor:
             if frame is None:
                 time.sleep(0.05)
                 continue
+            
+            # Fix 1080N aspect ratio (960x1080 -> 1920x1080)
+            if self.fix_1080n and frame.shape[1] == 960 and frame.shape[0] == 1080:
+                frame = cv2.resize(frame, (1920, 1080))
             
             # Determine if we run detection this frame
             run_detection = (self.frame_count % self.detection_interval == 0)
@@ -787,6 +793,7 @@ def main():
 
             # Render dashboard
             snapshot = stats.get_snapshot()
+            snapshot['queue_size'] = enhancer.queue.qsize()
             dashboard = render_dashboard(snapshot, width=420, height=720)
             cv2.imshow(WINDOW_DASHBOARD, dashboard)
 

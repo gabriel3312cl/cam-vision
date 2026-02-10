@@ -87,6 +87,9 @@ def scan_output_directory(output_dir):
                     # Check for image
                     if os.path.exists(os.path.join(item_path, "face.jpg")):
                         entry['image'] = os.path.join(item_path, "face.jpg")
+                        entry['enhanced'] = os.path.exists(os.path.join(item_path, "face_enhanced.jpg"))
+                    else:
+                        entry['enhanced'] = False
                     
                 elif 'vehicle_id' in data:
                     stats['total_vehicles'] += 1
@@ -99,6 +102,11 @@ def scan_output_directory(output_dir):
                     # Check for image
                     if os.path.exists(os.path.join(item_path, "vehicle_crop.jpg")):
                         entry['image'] = os.path.join(item_path, "vehicle_crop.jpg")
+                        entry['enhanced'] = os.path.exists(os.path.join(item_path, "vehicle_crop_enhanced.jpg"))
+                    else:
+                        entry['enhanced'] = False
+                
+                stats['history'].append(entry)
                 
                 stats['history'].append(entry)
 
@@ -133,6 +141,8 @@ def generate_history_html(history, output_file="history.html"):
             .badge { display: inline-block; padding: 2px 6px; border-radius: 3px; font-size: 11px; font-weight: bold; margin-right: 5px; }
             .bg-face { background: #4caf50; color: white; }
             .bg-vehicle { background: #ff9800; color: black; }
+            .bg-enhanced { background: #00bcd4; color: black; }
+            .bg-pending { background: #555; color: #ccc; }
             .meta { font-size: 12px; color: #aaa; margin-top: 5px; }
             .id { font-size: 16px; font-weight: bold; color: #fff; }
             .timestamp { display: block; margin-top: 4px; font-size: 11px; color: #666; }
@@ -180,12 +190,18 @@ def generate_history_html(history, output_file="history.html"):
         type_cls = "bg-face" if item['type'] == 'face' else "bg-vehicle"
         label = "Face" if item['type'] == 'face' else item.get('class', 'Vehicle').upper()
         
+        status_cls = "bg-enhanced" if item.get('enhanced') else "bg-pending"
+        status_label = "ENHANCED" if item.get('enhanced') else "PENDING"
+
         html += f"""
             <div class="card" data-type="{item['type']}">
                 <a href="{rel_img_path}" target="_blank">
                     <img src="{rel_img_path}" alt="{item['type']}" loading="lazy">
                 </a>
                 <div class="info">
+                    <div style="margin-bottom: 4px;">
+                        <span class="badge {status_cls}">{status_label}</span>
+                    </div>
                     <div>
                         <span class="badge {type_cls}">{label}</span>
                         <span class="id">#{item['id']}</span>

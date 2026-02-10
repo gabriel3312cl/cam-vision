@@ -59,9 +59,9 @@ class FaceDetectorGPU:
         """Generate anchor boxes for each feature map scale."""
         priors = []
         min_sizes_per_stride = {
-            8: [10, 16, 24],
-            16: [32, 48],
-            32: [64, 96, 128],
+            8: [8],
+            16: [16],
+            32: [32],
         }
 
         for stride in self.STRIDES:

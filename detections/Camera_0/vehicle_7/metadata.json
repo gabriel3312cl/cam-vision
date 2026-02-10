@@ -1,0 +1,13 @@
+{
+    "vehicle_id": 7,
+    "class": "truck",
+    "camera": "Camera_0",
+    "timestamp": "20260210_162304_566249",
+    "bbox": [
+        1033,
+        333,
+        -73,
+        386
+    ],
+    "confidence": 0.5816944241523743
+}
